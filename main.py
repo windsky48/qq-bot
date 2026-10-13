@@ -69,31 +69,37 @@ def configure_logging() -> logging.Logger:
 logger = configure_logging()
 
 
-def read_group_list(environment_name: str) -> tuple[str, ...]:
+def read_group_routes(environment_name: str) -> dict[str, str]:
     raw_value = os.getenv(environment_name, "").strip()
     if not raw_value:
-        return ()
+        return {}
     try:
         value = json.loads(raw_value)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"环境变量 {environment_name} 必须是 JSON 字符串列表"
+            f"环境变量 {environment_name} 必须是 JSON 字符串字典"
         ) from exc
-    if not isinstance(value, list) or not all(
-        isinstance(item, str) and item.strip() for item in value
+    if not isinstance(value, dict) or not all(
+        isinstance(source, str)
+        and source.strip()
+        and isinstance(target, str)
+        and target.strip()
+        for source, target in value.items()
     ):
         raise RuntimeError(
-            f"环境变量 {environment_name} 必须是非空字符串组成的 JSON 列表"
+            f"环境变量 {environment_name} 必须是接收群和发送群组成的 JSON 字符串字典"
         )
-    return tuple(dict.fromkeys(item.strip() for item in value))
+    return {
+        source.strip(): target.strip()
+        for source, target in value.items()
+    }
 
 
 @dataclass(frozen=True)
 class Settings:
     qq_app_id: str
     qq_app_secret: str
-    qq_receive_group_openids: tuple[str, ...]
-    qq_send_group_openids: tuple[str, ...]
+    qq_group_routes: dict[str, str]
     ai_base_url: str
     ai_api_key: str
     ai_model: str
@@ -103,8 +109,7 @@ class Settings:
         return cls(
             qq_app_id=os.getenv("QQ_APP_ID", "").strip(),
             qq_app_secret=os.getenv("QQ_APP_SECRET", "").strip(),
-            qq_receive_group_openids=read_group_list("QQ_RECEIVE_GROUP_OPENIDS"),
-            qq_send_group_openids=read_group_list("QQ_SEND_GROUP_OPENIDS"),
+            qq_group_routes=read_group_routes("QQ_GROUP_ROUTES"),
             ai_base_url=os.getenv("AI_BASE_URL", "").strip(),
             ai_api_key=os.getenv("AI_API_KEY", "").strip(),
             ai_model=os.getenv("AI_MODEL", "").strip(),
@@ -114,8 +119,7 @@ class Settings:
         values = {
             "QQ_APP_ID": self.qq_app_id,
             "QQ_APP_SECRET": self.qq_app_secret,
-            "QQ_RECEIVE_GROUP_OPENIDS": self.qq_receive_group_openids,
-            "QQ_SEND_GROUP_OPENIDS": self.qq_send_group_openids,
+            "QQ_GROUP_ROUTES": self.qq_group_routes,
             "AI_BASE_URL": self.ai_base_url,
             "AI_API_KEY": self.ai_api_key,
             "AI_MODEL": self.ai_model,
@@ -481,33 +485,31 @@ async def process_group_message(
         logger.exception("AI 消息后台处理出现未预期异常，event_id=%s", event_id)
         return
 
-    for index, target_group_openid in enumerate(settings.qq_send_group_openids):
-        if index:
-            await asyncio.sleep(0.8)
-        passive_msg_id = (
-            source_msg_id
-            if target_group_openid == source_group_openid
-            else None
+    target_group_openid = settings.qq_group_routes[source_group_openid]
+    passive_msg_id = (
+        source_msg_id
+        if target_group_openid == source_group_openid
+        else None
+    )
+    try:
+        await send_ai_reply(
+            client,
+            target_group_openid,
+            passive_msg_id,
+            ai_reply,
         )
-        try:
-            await send_ai_reply(
-                client,
-                target_group_openid,
-                passive_msg_id,
-                ai_reply,
-            )
-        except (httpx.HTTPError, RuntimeError):
-            logger.exception(
-                "向目标群发送回复失败，event_id=%s，target_group_openid=%s",
-                event_id,
-                target_group_openid,
-            )
-        except Exception:
-            logger.exception(
-                "向目标群发送回复时出现未预期异常，event_id=%s，target_group_openid=%s",
-                event_id,
-                target_group_openid,
-            )
+    except (httpx.HTTPError, RuntimeError):
+        logger.exception(
+            "向目标群发送回复失败，event_id=%s，target_group_openid=%s",
+            event_id,
+            target_group_openid,
+        )
+    except Exception:
+        logger.exception(
+            "向目标群发送回复时出现未预期异常，event_id=%s，target_group_openid=%s",
+            event_id,
+            target_group_openid,
+        )
 
 
 @asynccontextmanager
@@ -603,7 +605,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks) -> JSONRe
         )
         return JSONResponse({"op": 12})
 
-    if group_openid not in settings.qq_receive_group_openids:
+    if group_openid not in settings.qq_group_routes:
         logger.info(
             "忽略不在接收列表中的群消息，event_id=%s，group_openid=%s",
             event_id,

@@ -8,7 +8,7 @@
 - 支持 `op=13` 回调地址验证
 - 使用 Ed25519 校验 `op=0` 事件签名
 - 处理 `GROUP_MESSAGE_CREATE` 全量群消息
-- 分别配置允许接收消息和发送回复的群列表
+- 使用 JSON 字典配置接收群到发送群的一对一路由
 - 每个接收群独立累计 5 条消息后调用一次 AI
 - 缓存并提前刷新 QQ `access_token`
 - AI 回复超过 1900 字符时最多拆分为 5 片
@@ -50,8 +50,7 @@ Copy-Item .env.example .env
 QQ_APP_ID=your_qq_app_id
 QQ_APP_SECRET=your_qq_app_secret
 
-QQ_RECEIVE_GROUP_OPENIDS=["receive_group_openid_1","receive_group_openid_2"]
-QQ_SEND_GROUP_OPENIDS=["send_group_openid_1","send_group_openid_2"]
+QQ_GROUP_ROUTES={"receive_group_openid_1":"send_group_openid_1","receive_group_openid_2":"send_group_openid_2"}
 
 AI_BASE_URL=https://your-ai-api.example.com/v1
 AI_API_KEY=your_ai_api_key
@@ -64,21 +63,20 @@ AI_MODEL=your_model_name
 | --- | --- |
 | `QQ_APP_ID` | QQ 开放平台机器人 AppID |
 | `QQ_APP_SECRET` | QQ 开放平台机器人 AppSecret，同时用于生成 Ed25519 签名密钥 |
-| `QQ_RECEIVE_GROUP_OPENIDS` | 允许接收消息的群 `group_openid` JSON 字符串列表 |
-| `QQ_SEND_GROUP_OPENIDS` | AI 回复的目标群 `group_openid` JSON 字符串列表 |
+| `QQ_GROUP_ROUTES` | 接收群 `group_openid` 到发送群 `group_openid` 的一对一 JSON 字典 |
 | `AI_BASE_URL` | 兼容 OpenAI 格式的 API 基础地址，程序会自动追加 `/chat/completions` |
 | `AI_API_KEY` | AI API 密钥 |
 | `AI_MODEL` | AI 模型名称 |
 
-群列表必须使用 JSON 字符串数组，即使 ID 看起来是数字也必须加双引号：
+群路由必须使用 JSON 字符串字典，字典的键是接收群，值是该接收群唯一对应的发送群。即使 ID 看起来是数字也必须加双引号：
 
 ```env
-QQ_RECEIVE_GROUP_OPENIDS=["123456789"]
+QQ_GROUP_ROUTES={"receive_group_openid":"send_group_openid"}
 ```
 
-这里需要填写事件日志中的 `group_openid`，不能填写普通 QQ 群号。程序会忽略不在接收列表中的群消息，并将每个完成的消息批次广播到发送列表中的所有群。
+这里需要填写事件日志中的 `group_openid`，不能填写普通 QQ 群号。程序会忽略不在字典键中的群消息；某个接收群凑满 5 条后，AI 回复只发送到该键对应的目标群，不再广播到所有群。
 
-目标群与消息来源群相同时，第一条回复会携带原消息的 `msg_id` 作为被动回复；其他目标群使用主动消息，因此机器人必须具备主动推送权限。
+目标群与消息来源群相同时，第一条回复会携带原消息的 `msg_id` 作为被动回复；目标群不同时使用主动消息，因此机器人必须具备主动推送权限。
 
 ## 系统提示词
 
@@ -129,10 +127,10 @@ http://你的公网地址:8080/webhook
 
 1. QQ 平台向 `/webhook` 推送事件。
 2. 程序使用原始请求体和签名请求头进行 Ed25519 验签。
-3. 程序忽略机器人自身消息以及不在接收群列表中的消息。
+3. 程序忽略机器人自身消息以及不在 `QQ_GROUP_ROUTES` 键中的群消息。
 4. 每个来源群独立累计消息，前 4 条只缓存。
 5. 第 5 条到达后，将 5 条消息按顺序合并并调用一次 AI。
-6. AI 回复发送到 `QQ_SEND_GROUP_OPENIDS` 中的每个群。
+6. AI 回复只发送到 `QQ_GROUP_ROUTES` 中该来源群对应的目标群。
 7. 每个群完成一批后重新从 1/5 开始计数。
 
 消息批次保存在内存中。程序重启后，尚未凑满 5 条的消息会丢失并重新计数。
@@ -158,7 +156,7 @@ logs/YYYY-MM-DD.log
 
 - 回复不超过 1900 字符时直接发送一条。
 - 超过 1900 字符时最多拆分为 5 片。
-- 第一片在来源群中使用 `msg_id` 被动回复。
+- 目标群与来源群相同时，第一片使用 `msg_id` 被动回复；目标群不同时，所有分片均为主动消息。
 - 后续分片使用主动消息，每片间隔 0.8 秒。
 - 分片时尽量在换行处切分，避免截断代码块中的单行内容。
 - 主动消息发送失败时停止发送剩余分片。
@@ -171,7 +169,7 @@ logs/YYYY-MM-DD.log
 
 ### 日志显示“忽略不在接收列表中的群消息”
 
-将日志中的 `group_openid` 填入 `QQ_RECEIVE_GROUP_OPENIDS`，不要填写普通 QQ 群号，然后重启服务。
+将日志中的来源群 `group_openid` 作为键添加到 `QQ_GROUP_ROUTES`，并将唯一目标群 `group_openid` 作为值；不要填写普通 QQ 群号，然后重启服务。
 
 ### 收到“暂不能查看该消息内容”
 
