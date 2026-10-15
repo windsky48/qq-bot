@@ -286,6 +286,13 @@ async def call_ai(client: httpx.AsyncClient, user_message: str) -> str:
             },
             timeout=60.0,
         )
+        if response.is_error:
+            logger.error(
+                "AI API 返回错误状态，status=%s，url=%s，response=%s",
+                response.status_code,
+                response.request.url,
+                response.text[:500],
+            )
         response.raise_for_status()
         data = response.json()
         content = data["choices"][0]["message"]["content"]
