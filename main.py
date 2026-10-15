@@ -69,6 +69,26 @@ def configure_logging() -> logging.Logger:
 logger = configure_logging()
 
 
+def read_positive_seconds(
+    environment_name: str,
+    default_seconds: float,
+) -> float:
+    raw_value = os.getenv(environment_name, "").strip()
+    if not raw_value:
+        return default_seconds
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"环境变量 {environment_name} 必须是正数秒数"
+        ) from exc
+    if not value > 0:
+        raise RuntimeError(
+            f"环境变量 {environment_name} 必须是大于 0 的秒数"
+        )
+    return value
+
+
 def read_header_map(environment_name: str) -> dict[str, str]:
     raw_value = os.getenv(environment_name, "").strip()
     if not raw_value:
@@ -130,6 +150,8 @@ class Settings:
     ai_api_key: str
     ai_model: str
     ai_extra_headers: dict[str, str]
+    ai_timeout_seconds: float
+    qq_timeout_seconds: float
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -141,6 +163,11 @@ class Settings:
             ai_api_key=os.getenv("AI_API_KEY", "").strip(),
             ai_model=os.getenv("AI_MODEL", "").strip(),
             ai_extra_headers=read_header_map("AI_EXTRA_HEADERS"),
+            ai_timeout_seconds=read_positive_seconds("AI_TIMEOUT_SECONDS", 60.0),
+            qq_timeout_seconds=read_positive_seconds(
+                "QQ_TIMEOUT_SECONDS",
+                30.0,
+            ),
         )
 
     def missing_variables(self) -> list[str]:
@@ -313,7 +340,7 @@ async def call_ai(client: httpx.AsyncClient, user_message: str) -> str:
                     {"role": "user", "content": user_message},
                 ],
             },
-            timeout=60.0,
+            timeout=settings.ai_timeout_seconds,
         )
         if response.is_error:
             logger.error(
@@ -554,7 +581,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if missing:
         logger.warning("以下环境变量尚未配置：%s", ", ".join(missing))
     app.state.http_client = httpx.AsyncClient(
-        timeout=60.0,
+        timeout=settings.qq_timeout_seconds,
         trust_env=False,
     )
     logger.info("QQ Bot Webhook 服务启动")

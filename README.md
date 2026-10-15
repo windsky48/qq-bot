@@ -68,6 +68,8 @@ AI_MODEL=your_model_name
 | `AI_API_KEY` | AI API 密钥 |
 | `AI_MODEL` | AI 模型名称 |
 | `AI_EXTRA_HEADERS` | 可选，AI API 额外请求头 JSON 字典 |
+| `AI_TIMEOUT_SECONDS` | 可选，AI 请求超时秒数，默认 `60` |
+| `QQ_TIMEOUT_SECONDS` | 可选，QQ API 请求超时秒数，默认 `30` |
 
 群路由必须使用 JSON 字符串字典，字典的键是接收群，值是该接收群唯一对应的发送群。即使 ID 看起来是数字也必须加双引号：
 
