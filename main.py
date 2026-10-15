@@ -69,6 +69,32 @@ def configure_logging() -> logging.Logger:
 logger = configure_logging()
 
 
+def read_header_map(environment_name: str) -> dict[str, str]:
+    raw_value = os.getenv(environment_name, "").strip()
+    if not raw_value:
+        return {}
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"环境变量 {environment_name} 必须是 JSON 字符串字典"
+        ) from exc
+    if not isinstance(value, dict) or not all(
+        isinstance(name, str)
+        and name.strip()
+        and isinstance(header_value, str)
+        and header_value.strip()
+        for name, header_value in value.items()
+    ):
+        raise RuntimeError(
+            f"环境变量 {environment_name} 必须是请求头名和值组成的 JSON 字符串字典"
+        )
+    return {
+        name.strip(): header_value.strip()
+        for name, header_value in value.items()
+    }
+
+
 def read_group_routes(environment_name: str) -> dict[str, str]:
     raw_value = os.getenv(environment_name, "").strip()
     if not raw_value:
@@ -103,6 +129,7 @@ class Settings:
     ai_base_url: str
     ai_api_key: str
     ai_model: str
+    ai_extra_headers: dict[str, str]
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -113,6 +140,7 @@ class Settings:
             ai_base_url=os.getenv("AI_BASE_URL", "").strip(),
             ai_api_key=os.getenv("AI_API_KEY", "").strip(),
             ai_model=os.getenv("AI_MODEL", "").strip(),
+            ai_extra_headers=read_header_map("AI_EXTRA_HEADERS"),
         )
 
     def missing_variables(self) -> list[str]:
@@ -276,6 +304,7 @@ async def call_ai(client: httpx.AsyncClient, user_message: str) -> str:
             headers={
                 "Authorization": f"Bearer {settings.ai_api_key}",
                 "Content-Type": "application/json",
+                **settings.ai_extra_headers,
             },
             json={
                 "model": settings.ai_model,

@@ -67,6 +67,7 @@ AI_MODEL=your_model_name
 | `AI_BASE_URL` | 兼容 OpenAI 格式的 API 基础地址，程序会自动追加 `/chat/completions` |
 | `AI_API_KEY` | AI API 密钥 |
 | `AI_MODEL` | AI 模型名称 |
+| `AI_EXTRA_HEADERS` | 可选，AI API 额外请求头 JSON 字典 |
 
 群路由必须使用 JSON 字符串字典，字典的键是接收群，值是该接收群唯一对应的发送群。即使 ID 看起来是数字也必须加双引号：
 
@@ -174,6 +175,16 @@ logs/YYYY-MM-DD.log
 ### 收到“暂不能查看该消息内容”
 
 这是 QQ 平台放在 `d.content` 中的占位文字，常见于图片、语音、文件、卡片或其他暂不支持读取的消息类型。若纯文本也出现该内容，请让群主重新检查机器人的全量消息权限。
+
+### AI 请求出现 403
+
+说明密钥、模型权限或 API 来源校验未通过。请先确认 `AI_BASE_URL`、`AI_API_KEY`、`AI_MODEL` 与可用客户端完全一致。若该 API 校验来源标识或 `User-Agent`，可在 `.env` 中补充：
+
+```env
+AI_EXTRA_HEADERS={"HTTP-Referer":"https://your-site.example","X-Title":"QQ Bot","User-Agent":"CherryStudio/1.0"}
+```
+
+日志中的 `AI API 返回错误状态` 会打印实际请求地址和响应内容，可用于确认具体原因。
 
 ### AI 请求出现 `ReadTimeout`
 
