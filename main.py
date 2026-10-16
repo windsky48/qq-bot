@@ -418,6 +418,14 @@ def split_reply(
     return parts, truncated
 
 
+def format_event_dump(payload: Any) -> str:
+    try:
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        text = repr(payload)
+    return text[:4000]
+
+
 class MessageBatcher:
     def __init__(self, batch_size: int = 5) -> None:
         self.batch_size = batch_size
@@ -647,6 +655,12 @@ async def webhook(request: Request, background_tasks: BackgroundTasks) -> JSONRe
     if author.get("bot") is True:
         logger.info("忽略机器人自身消息，event_id=%s", payload.get("id", ""))
         return JSONResponse({"op": 12})
+
+    logger.info(
+        "收到群消息事件原文，event_id=%s，payload=%s",
+        payload.get("id", ""),
+        format_event_dump(payload),
+    )
 
     event_id = str(payload.get("id", ""))
     group_openid = str(data.get("group_openid", ""))
