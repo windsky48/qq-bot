@@ -69,6 +69,19 @@ def configure_logging() -> logging.Logger:
 logger = configure_logging()
 
 
+def read_flag(environment_name: str, default_value: bool) -> bool:
+    raw_value = os.getenv(environment_name, "").strip().lower()
+    if not raw_value:
+        return default_value
+    if raw_value in {"1", "true", "yes", "on"}:
+        return True
+    if raw_value in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(
+        f"环境变量 {environment_name} 只能是 true 或 false"
+    )
+
+
 def read_positive_seconds(
     environment_name: str,
     default_seconds: float,
@@ -152,6 +165,8 @@ class Settings:
     ai_extra_headers: dict[str, str]
     ai_timeout_seconds: float
     qq_timeout_seconds: float
+    qq_fetch_member_nickname: bool
+    ai_mention_senders: bool
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -168,6 +183,11 @@ class Settings:
                 "QQ_TIMEOUT_SECONDS",
                 30.0,
             ),
+            qq_fetch_member_nickname=read_flag(
+                "QQ_FETCH_MEMBER_NICKNAME",
+                True,
+            ),
+            ai_mention_senders=read_flag("AI_MENTION_SENDERS", True),
         )
 
     def missing_variables(self) -> list[str]:
@@ -271,6 +291,39 @@ class QQTokenManager:
 class QQMessageService:
     def __init__(self, token_manager: QQTokenManager) -> None:
         self._token_manager = token_manager
+
+    async def get_member_nickname(
+        self,
+        client: httpx.AsyncClient,
+        group_openid: str,
+        member_openid: str,
+    ) -> str:
+        token = await self._token_manager.get_access_token(client)
+        url = (
+            "https://api.bot.qq.com/v2/groups/"
+            f"{group_openid}/members/{member_openid}"
+        )
+        response = await client.get(
+            url,
+            headers={"Authorization": f"QQBot {token}"},
+        )
+        if response.status_code == 401:
+            self._token_manager.invalidate()
+        if response.is_error:
+            logger.warning(
+                "获取群成员信息失败，status=%s，group_openid=%s，member_openid=%s，response=%s",
+                response.status_code,
+                group_openid,
+                member_openid,
+                response.text[:300],
+            )
+            return ""
+        data = response.json()
+        for key in ("nick", "nickname", "member_nick", "name"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
 
     async def send_group_message(
         self,
@@ -426,20 +479,33 @@ def format_event_dump(payload: Any) -> str:
     return text[:4000]
 
 
+@dataclass(frozen=True)
+class MessageItem:
+    member_openid: str
+    nickname: str
+    content: str
+
+    @property
+    def sender_label(self) -> str:
+        if self.nickname:
+            return f"{self.nickname}（{self.member_openid}）"
+        return self.member_openid
+
+
 class MessageBatcher:
     def __init__(self, batch_size: int = 5) -> None:
         self.batch_size = batch_size
-        self._buffers: dict[str, list[str]] = {}
+        self._buffers: dict[str, list[MessageItem]] = {}
         self._lock = asyncio.Lock()
 
     async def add(
         self,
         group_openid: str,
-        content: str,
-    ) -> tuple[list[str] | None, int]:
+        item: MessageItem,
+    ) -> tuple[list[MessageItem] | None, int]:
         async with self._lock:
             buffer = self._buffers.setdefault(group_openid, [])
-            buffer.append(content)
+            buffer.append(item)
             count = len(buffer)
             if count < self.batch_size:
                 return None, count
@@ -454,12 +520,66 @@ class MessageBatcher:
 message_batcher = MessageBatcher(batch_size=5)
 
 
-def format_message_batch(messages: list[str]) -> str:
+async def resolve_member_nickname(
+    client: httpx.AsyncClient,
+    group_openid: str,
+    member_openid: str,
+) -> str:
+    if not settings.qq_fetch_member_nickname or not member_openid:
+        return ""
+    try:
+        return await qq_message_service.get_member_nickname(
+            client,
+            group_openid,
+            member_openid,
+        )
+    except (httpx.HTTPError, ValueError, RuntimeError):
+        logger.exception(
+            "获取群成员昵称异常，group_openid=%s，member_openid=%s",
+            group_openid,
+            member_openid,
+        )
+        return ""
+
+
+MENTION_PREFIX_MAX_LENGTH = 400
+
+
+def build_mention_prefix(messages: list[MessageItem]) -> str:
+    if not settings.ai_mention_senders:
+        return ""
+
+    member_openids = list(
+        dict.fromkeys(
+            message.member_openid
+            for message in messages
+            if message.member_openid
+        )
+    )
+    if not member_openids:
+        return ""
+
+    mentions = [f"<@{member_openid}>" for member_openid in member_openids]
+    prefix = " ".join(mentions) + " "
+    if len(prefix) > MENTION_PREFIX_MAX_LENGTH:
+        prefix = ""
+        for mention in mentions:
+            if len(prefix) + len(mention) + 1 > MENTION_PREFIX_MAX_LENGTH:
+                break
+            prefix += mention + " "
+    return prefix
+
+
+def format_message_batch(messages: list[MessageItem]) -> str:
     formatted_messages = "\n\n".join(
-        f"第 {index} 条消息：\n{message}"
+        f"第 {index} 条消息，发送者：{message.sender_label}（ID：{message.member_openid}）\n{message.content}"
         for index, message in enumerate(messages, start=1)
     )
-    return f"以下是群聊中连续收到的 {len(messages)} 条消息：\n\n{formatted_messages}"
+    return (
+        f"以下是群聊中连续收到的 {len(messages)} 条消息，"
+        f"其中发送者 ID 形如 ABC 的成员可用 <@ABC> 的形式 @ 对方：\n\n"
+        f"{formatted_messages}"
+    )
 
 
 async def send_ai_reply(
@@ -523,18 +643,28 @@ async def process_group_message(
     content: str,
     is_mentioned: bool,
 ) -> None:
+    nickname = await resolve_member_nickname(
+        client,
+        source_group_openid,
+        member_openid,
+    )
     logger.info(
-        "开始处理群消息，event_id=%s，group_openid=%s，member_openid=%s，mentioned=%s，length=%s，content=%s",
+        "开始处理群消息，event_id=%s，group_openid=%s，member_openid=%s，nickname=%s，mentioned=%s，length=%s，content=%s",
         event_id,
         source_group_openid,
         member_openid,
+        nickname,
         is_mentioned,
         len(content),
         content,
     )
     batch, buffered_count = await message_batcher.add(
         source_group_openid,
-        content,
+        MessageItem(
+            member_openid=member_openid,
+            nickname=nickname,
+            content=content,
+        ),
     )
     if batch is None:
         logger.info(
@@ -562,12 +692,21 @@ async def process_group_message(
         if target_group_openid == source_group_openid
         else None
     )
+    mention_prefix = build_mention_prefix(batch)
+    outgoing_reply = mention_prefix + ai_reply
+    if mention_prefix:
+        logger.info(
+            "AI 回复已添加 @ 前缀，group_openid=%s，target_group_openid=%s，mentions=%s",
+            source_group_openid,
+            target_group_openid,
+            mention_prefix.strip(),
+        )
     try:
         await send_ai_reply(
             client,
             target_group_openid,
             passive_msg_id,
-            ai_reply,
+            outgoing_reply,
         )
     except (httpx.HTTPError, RuntimeError):
         logger.exception(

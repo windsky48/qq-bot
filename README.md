@@ -68,6 +68,8 @@ AI_MODEL=your_model_name
 | `AI_API_KEY` | AI API 密钥 |
 | `AI_MODEL` | AI 模型名称 |
 | `AI_EXTRA_HEADERS` | 可选，AI API 额外请求头 JSON 字典 |
+| `AI_MENTION_SENDERS` | 可选，是否在 AI 回复开头 @ 本批消息发送者，默认 `true` |
+| `QQ_FETCH_MEMBER_NICKNAME` | 可选，是否调用 QQ API 获取群成员昵称，默认 `true` |
 | `AI_TIMEOUT_SECONDS` | 可选，AI 请求超时秒数，默认 `60` |
 | `QQ_TIMEOUT_SECONDS` | 可选，QQ API 请求超时秒数，默认 `30` |
 
@@ -153,7 +155,25 @@ logs/YYYY-MM-DD.log
 群消息批次已满，开始调用 AI，count=5
 ```
 
-日志会记录收到的消息原文、事件 ID、群 `openid`、发送者 `openid`、批次进度、AI 调用错误和 QQ 消息发送错误。请妥善保管日志，避免泄露群聊内容。
+日志会记录收到的消息原文、事件 ID、群 `openid`、发送者 `openid`、发送者昵称、批次进度、AI 调用错误和 QQ 消息发送错误。请妥善保管日志，避免泄露群聊内容。
+
+发送者昵称通过 QQ API 拉取，受 `QQ_FETCH_MEMBER_NICKNAME` 控制。拉取失败时只记录发送者 `openid`，不影响机器人回复。发送给 AI 的批次文本中也会包含每条消息的发送者昵称和 ID。
+
+## @ 成员
+
+默认会在每批 AI 回复开头加上本批消息发送者的 @，例如：
+
+```text
+<@成员openid1> <@成员openid2> AI 回复内容
+```
+
+相关行为：
+
+- 同一批中的重复发送者只 @ 一次。
+- @ 前缀位于第一片回复开头。
+- @ 前缀最长约 400 字符，超出时会按发送者数量截断。
+- 可用 `AI_MENTION_SENDERS=false` 关闭。
+- 发送给 AI 的批次文本会说明：需要 @ 某个成员时，在回复中使用 `<@成员openid>` 形式。
 
 ## 回复分片
 
