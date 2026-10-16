@@ -587,7 +587,10 @@ def format_event_dump(payload: Any) -> str:
     return text[:4000]
 
 
-MENTION_TAG_PATTERN = re.compile(r"<@([^>\s]{1,64})>")
+MENTION_TAG_PATTERN = re.compile(
+    r"<@([^>\s]{1,64})>|"
+    r"<qqbot-at-user\s+id=\"([^\"\s]{1,64})\"\s*/?>"
+)
 
 
 @dataclass(frozen=True)
@@ -704,39 +707,47 @@ def build_mention_instruction(messages: list[MessageItem]) -> str:
         return ""
 
     available = "、".join(
-        f"<@{member_openid}>"
+        f"<qqbot-at-user id=\"{member_openid}\" />"
         for member_openid in member_openids
     )
     return (
         "\n\n【@ 成员说明】\n"
-        "如果你想在回复中点名某位群友，请在需要的位置使用 "
-        "<@成员openid> 的形式，openid 必须原样取自下方列表。\n"
+        "如果你想在回复中点名某位群友，"
+        "请原样输出 <qqbot-at-user id=\"成员openid\" /> 这样的标签，"
+        "其中的 openid 必须取自下方列表。\n"
         "只能使用下方列表中出现过的 openid，"
         "严禁自行编造、猜测或改写 openid；"
         "使用不存在的 openid 会导致 @ 失效并显示为乱码文本。\n"
-        f"本批消息中可 @ 的成员 openid 为：{available}\n"
+        f"本批消息中可 @ 的成员标签为：{available}\n"
         "可以 @ 一位或多位，多位之间用空格分隔，且必须写在回复正文中。\n"
         "是否 @ 由你根据语境自行判断；"
-        "如果不需要点名任何人，请不要输出 <@ 形式的文本。"
+        "如果不需要点名任何人，请不要输出上述标签。"
     )
+
+
+def build_at_user_tag(member_openid: str) -> str:
+    return f'<qqbot-at-user id="{member_openid}" />'
 
 
 def sanitize_mentions(
     text: str,
     allowed_openids: dict[str, str],
 ) -> tuple[str, int, int]:
-    """仅保留本批消息中真实存在的 @ 目标，避免 AI 编造 openid。"""
+    """把 AI 输出统一为 QQ 原生提及格式，并过滤不存在的 openid。"""
 
-    found = re.findall(MENTION_TAG_PATTERN, text)
+    found = [
+        legacy_openid or xml_openid
+        for legacy_openid, xml_openid in MENTION_TAG_PATTERN.findall(text)
+    ]
     valid_count = sum(
         1 for member_openid in found if member_openid in allowed_openids
     )
     invalid_count = len(found) - valid_count
 
     def replace_mention(match: re.Match[str]) -> str:
-        member_openid = match.group(1)
+        member_openid = match.group(1) or match.group(2)
         if member_openid in allowed_openids:
-            return match.group(0)
+            return build_at_user_tag(member_openid)
         nickname = allowed_openids.get(member_openid)
         return f"@{nickname}" if nickname else "@群友"
 
@@ -765,7 +776,7 @@ def convert_named_mentions(
         if not member_openid:
             return match.group(0)
         converted += 1
-        return f"<@{member_openid}>"
+        return build_at_user_tag(member_openid)
 
     return named_pattern.sub(replace_named, text), converted
 
@@ -1022,8 +1033,9 @@ async def process_group_message(
     source_msg_id: str,
     content: str,
     is_mentioned: bool,
+    username: str = "",
 ) -> None:
-    nickname = await resolve_member_nickname(
+    nickname = username or await resolve_member_nickname(
         client,
         source_group_openid,
         member_openid,
@@ -1332,6 +1344,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks) -> JSONRe
     event_id = str(payload.get("id", ""))
     group_openid = str(data.get("group_openid", ""))
     member_openid = str(author.get("member_openid", ""))
+    username = str(author.get("username", "")).strip()
     content = str(data.get("content", ""))
     source_msg_id = str(data.get("id", ""))
     mentions = data.get("mentions") or []
@@ -1366,6 +1379,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks) -> JSONRe
         source_msg_id,
         content,
         is_mentioned,
+        username,
     )
     return JSONResponse({"op": 12})
 
