@@ -86,6 +86,7 @@ AI_MODEL=your_model_name
 | `BOT_MENTION_RATE_LIMIT` | 可选，每个成员窗口期内最多 @ 次数，默认 `5` |
 | `BOT_MENTION_RATE_WINDOW_SECONDS` | 可选，@ 频率统计窗口秒数，默认 `60` |
 | `BOT_MENTION_BUSY_MESSAGE` | 可选，超出频率限制时的提示语，默认 `哎呀，不要AT我了喵` |
+| `GROUP_MENTION_FORCE_ACTIVE` | 可选，回复含有效 @ 时是否改为主动消息发送，默认 `false` |
 | `QQ_PRIVATE_CHAT_ENABLED` | 可选，是否启用私聊消息，默认 `true` |
 | `QQ_PRIVATE_CHAT_ALLOWLIST` | 可选，允许私聊的 `user_openid` JSON 字符串列表，留空表示不限制 |
 | `QQ_FETCH_MEMBER_NICKNAME` | 可选，是否调用 QQ API 获取群成员昵称，默认 `true` |
@@ -231,11 +232,14 @@ AI 回复示例：
 
 相关行为：
 
-- 是否 @ 由 AI 自行决定，程序不强制添加。
+- QQ 没有独立的 @ 字段，`content` 中的 `<@openid>` 就是原生 @ 格式。
+- AI 可以直接输出 `<@openid>`，也可以输出 `@昵称`，程序会自动把 `@昵称`、`＠昵称` 转成原生 `<@openid>`。
 - 发送前会校验 AI 输出的 `@` 目标，只保留本批消息中真实存在的 `openid`。
 - 无效目标会被替换为 `@群友`，避免群里出现 `<@乱码>`。
-- 日志会记录：`AI 回复中包含有效 @ 成员，count=1`，或 `AI 回复中存在无效 @ 目标，已替换为普通文本，invalid=1`。
+- 日志会记录：`AI 回复中的 @昵称 已转换为原生提及，converted=1`、`AI 回复中包含有效 @ 成员，count=1`、`AI 回复中存在无效 @ 目标，已替换为普通文本，invalid=1`。
 - 可用 `AI_MENTION_INSTRUCTION=false` 关闭该说明。
+
+注意：`@昵称` 转换依赖成员昵称，需保证 `QQ_FETCH_MEMBER_NICKNAME=true` 且成员昵称接口可用。
 
 ## 被 @ 时立即回复
 
@@ -269,6 +273,28 @@ BOT_MENTION_BUSY_MESSAGE=哎呀，不要AT我了喵
 机器人被 @，立即调用 AI，group_openid=...，member_openid=...
 触发 @ 频率限制，忽略 AI 调用，group_openid=...，member_openid=...，limit=5，window=60.0
 ```
+
+### @ 显示为纯文本
+
+若群里看到 `<@openid>` 原文而不是 @ 效果，通常是以下原因：
+
+- 目标 openid 不在本群，或属于其他群。
+- AI 编造了不存在的 openid，程序已自动替换为 `@群友`。
+- 被动回复（带 `msg_id`）中 @ 不被渲染。
+
+第三种情况可用开关改为主动消息发送：
+
+```env
+GROUP_MENTION_FORCE_ACTIVE=true
+```
+
+开启后，含有效 @ 的回复会去掉 `msg_id` 改为主动发送，日志会记录：
+
+```text
+回复含 @ 成员，按配置改为主动消息发送，group_openid=...，event_id=...
+```
+
+注意：主动消息需要机器人在开放平台具备主动推送权限，且不受被动回复 5 条 / 5 分钟限制约束。
 
 ## 回复分片
 
