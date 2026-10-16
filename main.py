@@ -208,7 +208,6 @@ class Settings:
     bot_mention_rate_limit: int
     bot_mention_rate_window_seconds: float
     bot_mention_busy_message: str
-    group_mention_force_active: bool
     qq_private_chat_enabled: bool
     qq_private_chat_allowlist: tuple[str, ...]
 
@@ -231,7 +230,7 @@ class Settings:
                 "QQ_FETCH_MEMBER_NICKNAME",
                 True,
             ),
-            ai_mention_instruction=read_flag("AI_MENTION_INSTRUCTION", True),
+            ai_mention_instruction=read_flag("AI_MENTION_INSTRUCTION", False),
             bot_mention_reply_enabled=read_flag(
                 "BOT_MENTION_REPLY_ENABLED",
                 True,
@@ -249,10 +248,6 @@ class Settings:
                 "哎呀，不要AT我了喵",
             ).strip()
             or "哎呀，不要AT我了喵",
-            group_mention_force_active=read_flag(
-                "GROUP_MENTION_FORCE_ACTIVE",
-                False,
-            ),
             qq_private_chat_enabled=read_flag(
                 "QQ_PRIVATE_CHAT_ENABLED",
                 True,
@@ -707,33 +702,28 @@ def build_mention_instruction(messages: list[MessageItem]) -> str:
         return ""
 
     available = "、".join(
-        f"<qqbot-at-user id=\"{member_openid}\" />"
-        for member_openid in member_openids
+        nickname or member_openid
+        for member_openid, nickname in (
+            (message.member_openid, message.nickname)
+            for message in messages
+            if message.member_openid
+        )
     )
     return (
         "\n\n【@ 成员说明】\n"
         "如果你想在回复中点名某位群友，"
-        "请原样输出 <qqbot-at-user id=\"成员openid\" /> 这样的标签，"
-        "其中的 openid 必须取自下方列表。\n"
-        "只能使用下方列表中出现过的 openid，"
-        "严禁自行编造、猜测或改写 openid；"
-        "使用不存在的 openid 会导致 @ 失效并显示为乱码文本。\n"
-        f"本批消息中可 @ 的成员标签为：{available}\n"
-        "可以 @ 一位或多位，多位之间用空格分隔，且必须写在回复正文中。\n"
-        "是否 @ 由你根据语境自行判断；"
-        "如果不需要点名任何人，请不要输出上述标签。"
+        "直接写 @昵称 这样的纯文本即可，"
+        "不要输出 <@ 之类的标记，也不要编造任何 ID。\n"
+        f"本批消息中出现的成员为：{available}\n"
+        "是否 @ 由你根据语境自行判断。"
     )
-
-
-def build_at_user_tag(member_openid: str) -> str:
-    return f'<qqbot-at-user id="{member_openid}" />'
 
 
 def sanitize_mentions(
     text: str,
     allowed_openids: dict[str, str],
 ) -> tuple[str, int, int]:
-    """把 AI 输出统一为 QQ 原生提及格式，并过滤不存在的 openid。"""
+    """把 AI 输出中的 @ 标记统一降级为纯文本 @昵称。"""
 
     found = [
         legacy_openid or xml_openid
@@ -746,8 +736,6 @@ def sanitize_mentions(
 
     def replace_mention(match: re.Match[str]) -> str:
         member_openid = match.group(1) or match.group(2)
-        if member_openid in allowed_openids:
-            return build_at_user_tag(member_openid)
         nickname = allowed_openids.get(member_openid)
         return f"@{nickname}" if nickname else "@群友"
 
@@ -755,55 +743,22 @@ def sanitize_mentions(
     return sanitized, valid_count, invalid_count
 
 
-def convert_named_mentions(
-    text: str,
-    nickname_to_openid: dict[str, str],
-) -> tuple[str, int]:
-    """把 AI 写的 @昵称 转换成 QQ 原生的 <@openid> 提及格式。"""
-
-    if not nickname_to_openid:
-        return text, 0
-
-    names = sorted(nickname_to_openid, key=len, reverse=True)
-    named_pattern = re.compile(
-        r"(?<!<)[@＠](" + "|".join(re.escape(name) for name in names) + r")"
-    )
-    converted = 0
-
-    def replace_named(match: re.Match[str]) -> str:
-        nonlocal converted
-        member_openid = nickname_to_openid.get(match.group(1))
-        if not member_openid:
-            return match.group(0)
-        converted += 1
-        return build_at_user_tag(member_openid)
-
-    return named_pattern.sub(replace_named, text), converted
-
-
 def normalize_ai_mentions(
     text: str,
     items: list[MessageItem],
-) -> tuple[str, int, int, int]:
+) -> tuple[str, int, int]:
+    """把 AI 输出中的所有提及标记降级为纯文本 @昵称。"""
+
     allowed_openids = {
         item.member_openid: item.nickname
         for item in items
         if item.member_openid
     }
-    nickname_to_openid = {
-        item.nickname: item.member_openid
-        for item in items
-        if item.member_openid and item.nickname
-    }
-    converted_text, converted_count = convert_named_mentions(
-        text,
-        nickname_to_openid,
-    )
     sanitized, valid_count, invalid_count = sanitize_mentions(
-        converted_text,
+        text,
         allowed_openids,
     )
-    return sanitized, valid_count, invalid_count, converted_count
+    return sanitized, valid_count, invalid_count
 
 
 def format_message_batch(messages: list[MessageItem]) -> str:
@@ -828,10 +783,11 @@ async def send_ai_reply(
     parts, truncated = split_reply(ai_reply)
     await send_part(client, parts[0], source_msg_id)
     logger.info(
-        "已发送第 1/%s 片回复，target=%s，truncated=%s",
+        "已发送第 1/%s 片回复，target=%s，truncated=%s，content=%s",
         len(parts),
         target_label,
         truncated,
+        parts[0][:500],
     )
 
     for index, part in enumerate(parts[1:], start=2):
@@ -869,18 +825,12 @@ async def deliver_group_reply(
         ai_reply,
         valid_mentions,
         invalid_mentions,
-        converted_mentions,
     ) = normalize_ai_mentions(ai_reply, items)
-    if converted_mentions:
+    if valid_mentions or invalid_mentions:
         logger.info(
-            "AI 回复中的 @昵称 已转换为原生提及，event_id=%s，converted=%s",
+            "AI 回复中的提及标记已降级为纯文本，event_id=%s，resolved=%s，unresolved=%s",
             event_id,
-            converted_mentions,
-        )
-    if invalid_mentions:
-        logger.warning(
-            "AI 回复中存在无效 @ 目标，已替换为普通文本，event_id=%s，invalid=%s",
-            event_id,
+            valid_mentions,
             invalid_mentions,
         )
 
@@ -890,22 +840,6 @@ async def deliver_group_reply(
         if target_group_openid == source_group_openid
         else None
     )
-    if valid_mentions and settings.group_mention_force_active:
-        if passive_msg_id:
-            logger.info(
-                "回复含 @ 成员，按配置改为主动消息发送，group_openid=%s，event_id=%s",
-                target_group_openid,
-                event_id,
-            )
-        passive_msg_id = None
-
-    if valid_mentions:
-        logger.info(
-            "AI 回复中包含有效 @ 成员，group_openid=%s，target_group_openid=%s，count=%s",
-            source_group_openid,
-            target_group_openid,
-            valid_mentions,
-        )
 
     async def send_group_part(
         target_client: httpx.AsyncClient,

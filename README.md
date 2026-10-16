@@ -81,12 +81,11 @@ AI_MODEL=your_model_name
 | `AI_API_KEY` | AI API 密钥 |
 | `AI_MODEL` | AI 模型名称 |
 | `AI_EXTRA_HEADERS` | 可选，AI API 额外请求头 JSON 字典 |
-| `AI_MENTION_INSTRUCTION` | 可选，是否在发送给 AI 的群聊内容末尾附加 @ 成员说明，默认 `true` |
+| `AI_MENTION_INSTRUCTION` | 可选，是否向 AI 说明可以使用 @昵称，默认 `false` |
 | `BOT_MENTION_REPLY_ENABLED` | 可选，被 @ 时是否立即回复，默认 `true` |
 | `BOT_MENTION_RATE_LIMIT` | 可选，每个成员窗口期内最多 @ 次数，默认 `5` |
 | `BOT_MENTION_RATE_WINDOW_SECONDS` | 可选，@ 频率统计窗口秒数，默认 `60` |
 | `BOT_MENTION_BUSY_MESSAGE` | 可选，超出频率限制时的提示语，默认 `哎呀，不要AT我了喵` |
-| `GROUP_MENTION_FORCE_ACTIVE` | 可选，回复含有效 @ 时是否改为主动消息发送，默认 `false` |
 | `QQ_PRIVATE_CHAT_ENABLED` | 可选，是否启用私聊消息，默认 `true` |
 | `QQ_PRIVATE_CHAT_ALLOWLIST` | 可选，允许私聊的 `user_openid` JSON 字符串列表，留空表示不限制 |
 | `QQ_FETCH_MEMBER_NICKNAME` | 可选，是否调用 QQ API 获取群成员昵称，默认 `true` |
@@ -212,33 +211,26 @@ logs/YYYY-MM-DD.log
 
 ## @ 成员
 
-程序不再自动添加 @，而是由 AI 自行决定是否点名成员。
+当前统一使用纯文本 `@昵称`，不生成 QQ 原生 @ 标签。
 
-发送给 AI 的群聊批次文本末尾会附加 @ 说明：
+原因：实测群聊中 `<@openid>` 和官方推荐的 `<qqbot-at-user id="..." />` 都无法渲染为可点击的 @，当前机器人没有该能力。
 
-```text
-【@ 成员说明】
-如果你想在回复中点名某位群友，请原样输出 <qqbot-at-user id="成员openid" /> 这样的标签……
-本批消息中可 @ 的成员标签为：<qqbot-at-user id="ABC" />……
-是否 @ 由你根据语境自行判断……
-```
+程序行为：
 
-AI 回复示例：
+- 默认不再向 AI 说明 @ 用法，`AI_MENTION_INSTRUCTION` 默认为 `false`。
+- 若 AI 仍输出提及标记（旧格式或新格式），会自动降级为纯文本：
 
 ```text
-<qqbot-at-user id="ABC123" /> 你说的这个问题我知道
+<@UID1> 你好                      -> @Stay? 你好
+<qqbot-at-user id="UID1" /> 你好  -> @Stay? 你好
+<@不存在的ID> 编造                -> @群友 编造
 ```
 
-相关行为：
+- 昵称取事件中的 `d.author.username`；没有昵称时降级为 `@群友`。
+- 日志：`AI 回复中的提及标记已降级为纯文本，resolved=1，unresolved=0`。
+- 若想恢复让 AI 自行使用 `@昵称`，设 `AI_MENTION_INSTRUCTION=true`。
 
-- 官方推荐的提及格式是 `<qqbot-at-user id="member_openid" />`，旧的 `<@openid>` 已标注即将弃用。
-- 程序会把 AI 的任意写法统一为原生格式：`@昵称`、`＠昵称`、`<@openid>`、已正确的 XML 标签。
-- 发送前会校验 @ 目标，只保留本批消息中真实存在的 `openid`。
-- 无效目标会被替换为 `@群友`，避免群里出现乱码文本。
-- 日志会记录：`AI 回复中的 @昵称 已转换为原生提及，converted=1`、`AI 回复中包含有效 @ 成员，count=1`、`AI 回复中存在无效 @ 目标，已替换为普通文本，invalid=1`。
-- 可用 `AI_MENTION_INSTRUCTION=false` 关闭该说明。
-
-注意：`@昵称` 转换依赖成员昵称。昵称优先取事件中的 `d.author.username`；只有在事件未提供时才会调用成员信息接口。
+昵称获取优先使用事件字段；只有在事件未提供昵称且 `QQ_FETCH_MEMBER_NICKNAME=true` 时才会调用成员信息接口。
 
 ## 被 @ 时立即回复
 
@@ -248,7 +240,7 @@ AI 回复示例：
 
 - 按成员 `member_openid` 独立统计。
 - 默认 60 秒内最多 5 次。
-- 超限时不调用 AI，回复 `<@发送者> 哎呀，不要AT我了喵`。
+- 超限时不调用 AI，回复 `@发送者 哎呀，不要AT我了喵`。
 - 该提示使用被动回复，不占用主动消息配额。
 
 配置：
@@ -273,27 +265,11 @@ BOT_MENTION_BUSY_MESSAGE=哎呀，不要AT我了喵
 触发 @ 频率限制，忽略 AI 调用，group_openid=...，member_openid=...，limit=5，window=60.0
 ```
 
-### @ 显示为纯文本
+### 想恢复原生 @ 但不生效
 
-若群里看到 `<@openid>` 原文而不是 @ 效果，通常是以下原因：
+实测本机器人无法生成可点击的 @，群聊中 `<@openid>` 与 `<qqbot-at-user id="..." />` 都会显示为纯文本。程序已统一降级为 `@昵称`，不会再输出标记。
 
-- 目标 openid 不在本群，或属于其他群。
-- AI 编造了不存在的 openid，程序已自动替换为 `@群友`。
-- 被动回复（带 `msg_id`）中 @ 不被渲染。
-
-第三种情况可用开关改为主动消息发送：
-
-```env
-GROUP_MENTION_FORCE_ACTIVE=true
-```
-
-开启后，含有效 @ 的回复会去掉 `msg_id` 改为主动发送，日志会记录：
-
-```text
-回复含 @ 成员，按配置改为主动消息发送，group_openid=...，event_id=...
-```
-
-注意：主动消息需要机器人在开放平台具备主动推送权限，且不受被动回复 5 条 / 5 分钟限制约束。
+如果后续平台开放了该能力，可重新启用原生格式；在此之前保持默认的纯文本行为即可。
 
 ## 回复分片
 
