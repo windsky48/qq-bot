@@ -10,6 +10,7 @@
 - 处理 `GROUP_MESSAGE_CREATE` 全量群消息
 - 处理 `C2C_MESSAGE_CREATE` 私聊消息，单条即时回复
 - 使用 JSON 字典配置接收群到发送群的一对一路由
+- 群消息被 @ 时跳过批处理，立即回复，并按成员限制 @ 频率
 - 每个接收群独立累计 5 条消息后调用一次 AI
 - 缓存并提前刷新 QQ `access_token`
 - AI 回复超过 1900 字符时最多拆分为 5 片
@@ -81,6 +82,10 @@ AI_MODEL=your_model_name
 | `AI_MODEL` | AI 模型名称 |
 | `AI_EXTRA_HEADERS` | 可选，AI API 额外请求头 JSON 字典 |
 | `AI_MENTION_INSTRUCTION` | 可选，是否在发送给 AI 的群聊内容末尾附加 @ 成员说明，默认 `true` |
+| `BOT_MENTION_REPLY_ENABLED` | 可选，被 @ 时是否立即回复，默认 `true` |
+| `BOT_MENTION_RATE_LIMIT` | 可选，每个成员窗口期内最多 @ 次数，默认 `5` |
+| `BOT_MENTION_RATE_WINDOW_SECONDS` | 可选，@ 频率统计窗口秒数，默认 `60` |
+| `BOT_MENTION_BUSY_MESSAGE` | 可选，超出频率限制时的提示语，默认 `哎呀，不要AT我了喵` |
 | `QQ_PRIVATE_CHAT_ENABLED` | 可选，是否启用私聊消息，默认 `true` |
 | `QQ_PRIVATE_CHAT_ALLOWLIST` | 可选，允许私聊的 `user_openid` JSON 字符串列表，留空表示不限制 |
 | `QQ_FETCH_MEMBER_NICKNAME` | 可选，是否调用 QQ API 获取群成员昵称，默认 `true` |
@@ -229,6 +234,39 @@ AI 回复示例：
 - AI 输出的 `<@成员openid>` 会被 QQ 平台渲染为 @。
 - 若 AI 输出中含 `@`，日志会记录数量：`AI 回复中包含 @ 成员，count=1`。
 - 可用 `AI_MENTION_INSTRUCTION=false` 关闭该说明。
+
+## 被 @ 时立即回复
+
+群消息中 `d.mentions` 里出现 `is_you: true` 时，机器人跳过 5 条批处理，立即用该条消息调用 AI 并回复。
+
+频率限制：
+
+- 按成员 `member_openid` 独立统计。
+- 默认 60 秒内最多 5 次。
+- 超限时不调用 AI，回复 `<@发送者> 哎呀，不要AT我了喵`。
+- 该提示使用被动回复，不占用主动消息配额。
+
+配置：
+
+```env
+BOT_MENTION_REPLY_ENABLED=true
+BOT_MENTION_RATE_LIMIT=5
+BOT_MENTION_RATE_WINDOW_SECONDS=60
+BOT_MENTION_BUSY_MESSAGE=哎呀，不要AT我了喵
+```
+
+说明：
+
+- 消息文本中的 `<@xxx>` 标签会在发送给 AI 前去掉。
+- 立即回复同样使用 `prompt-group.txt`，并附带可 @ 成员说明。
+- 限流状态保存在内存中，重启后清空。
+
+日志：
+
+```text
+机器人被 @，立即调用 AI，group_openid=...，member_openid=...
+触发 @ 频率限制，忽略 AI 调用，group_openid=...，member_openid=...，limit=5，window=60.0
+```
 
 ## 回复分片
 

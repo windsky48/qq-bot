@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -128,6 +129,23 @@ def read_header_map(environment_name: str) -> dict[str, str]:
     }
 
 
+def read_positive_int(environment_name: str, default_value: int) -> int:
+    raw_value = os.getenv(environment_name, "").strip()
+    if not raw_value:
+        return default_value
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"环境变量 {environment_name} 必须是正整数"
+        ) from exc
+    if value <= 0:
+        raise RuntimeError(
+            f"环境变量 {environment_name} 必须是大于 0 的整数"
+        )
+    return value
+
+
 def read_openid_list(environment_name: str) -> tuple[str, ...]:
     raw_value = os.getenv(environment_name, "").strip()
     if not raw_value:
@@ -186,6 +204,10 @@ class Settings:
     qq_timeout_seconds: float
     qq_fetch_member_nickname: bool
     ai_mention_instruction: bool
+    bot_mention_reply_enabled: bool
+    bot_mention_rate_limit: int
+    bot_mention_rate_window_seconds: float
+    bot_mention_busy_message: str
     qq_private_chat_enabled: bool
     qq_private_chat_allowlist: tuple[str, ...]
 
@@ -209,6 +231,23 @@ class Settings:
                 True,
             ),
             ai_mention_instruction=read_flag("AI_MENTION_INSTRUCTION", True),
+            bot_mention_reply_enabled=read_flag(
+                "BOT_MENTION_REPLY_ENABLED",
+                True,
+            ),
+            bot_mention_rate_limit=read_positive_int(
+                "BOT_MENTION_RATE_LIMIT",
+                5,
+            ),
+            bot_mention_rate_window_seconds=read_positive_seconds(
+                "BOT_MENTION_RATE_WINDOW_SECONDS",
+                60.0,
+            ),
+            bot_mention_busy_message=os.getenv(
+                "BOT_MENTION_BUSY_MESSAGE",
+                "哎呀，不要AT我了喵",
+            ).strip()
+            or "哎呀，不要AT我了喵",
             qq_private_chat_enabled=read_flag(
                 "QQ_PRIVATE_CHAT_ENABLED",
                 True,
@@ -543,6 +582,9 @@ def format_event_dump(payload: Any) -> str:
     return text[:4000]
 
 
+MENTION_TAG_PATTERN = re.compile(r"<@[^>\s]{1,64}>")
+
+
 @dataclass(frozen=True)
 class MessageItem:
     member_openid: str
@@ -582,6 +624,42 @@ class MessageBatcher:
 
 
 message_batcher = MessageBatcher(batch_size=5)
+
+
+class MentionRateLimiter:
+    """按成员限制单位时间内的被 @ 次数。"""
+
+    def __init__(self, limit: int, window_seconds: float) -> None:
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self._hits: dict[str, list[float]] = {}
+
+    def is_limited(self, member_openid: str) -> bool:
+        if not member_openid:
+            return True
+        now = time.monotonic()
+        window_start = now - self.window_seconds
+        recent = [
+            timestamp
+            for timestamp in self._hits.get(member_openid, ())
+            if timestamp > window_start
+        ]
+        if len(recent) >= self.limit:
+            self._hits[member_openid] = recent
+            return True
+        recent.append(now)
+        self._hits[member_openid] = recent
+        return False
+
+
+mention_rate_limiter = MentionRateLimiter(
+    settings.bot_mention_rate_limit,
+    settings.bot_mention_rate_window_seconds,
+)
+
+
+def strip_mention_tags(text: str) -> str:
+    return MENTION_TAG_PATTERN.sub("", text).strip()
 
 
 async def resolve_member_nickname(
@@ -687,62 +765,13 @@ async def send_ai_reply(
             break
 
 
-async def process_group_message(
+async def deliver_group_reply(
     client: httpx.AsyncClient,
     event_id: str,
     source_group_openid: str,
-    member_openid: str,
     source_msg_id: str,
-    content: str,
-    is_mentioned: bool,
+    ai_reply: str,
 ) -> None:
-    nickname = await resolve_member_nickname(
-        client,
-        source_group_openid,
-        member_openid,
-    )
-    logger.info(
-        "开始处理群消息，event_id=%s，group_openid=%s，member_openid=%s，nickname=%s，mentioned=%s，length=%s，content=%s",
-        event_id,
-        source_group_openid,
-        member_openid,
-        nickname,
-        is_mentioned,
-        len(content),
-        content,
-    )
-    batch, buffered_count = await message_batcher.add(
-        source_group_openid,
-        MessageItem(
-            member_openid=member_openid,
-            nickname=nickname,
-            content=content,
-        ),
-    )
-    if batch is None:
-        logger.info(
-            "群消息已加入 AI 批次，group_openid=%s，progress=%s/%s",
-            source_group_openid,
-            buffered_count,
-            message_batcher.batch_size,
-        )
-        return
-
-    logger.info(
-        "群消息批次已满，开始调用 AI，group_openid=%s，count=%s",
-        source_group_openid,
-        len(batch),
-    )
-    try:
-        ai_reply = await call_ai(
-            client,
-            format_message_batch(batch),
-            GROUP_PROMPT_FILE,
-        )
-    except Exception:
-        logger.exception("AI 消息后台处理出现未预期异常，event_id=%s", event_id)
-        return
-
     target_group_openid = settings.qq_group_routes[source_group_openid]
     passive_msg_id = (
         source_msg_id
@@ -790,6 +819,166 @@ async def process_group_message(
             event_id,
             target_group_openid,
         )
+
+
+async def send_mention_busy_reply(
+    client: httpx.AsyncClient,
+    source_group_openid: str,
+    source_msg_id: str,
+    member_openid: str,
+) -> None:
+    target_group_openid = settings.qq_group_routes[source_group_openid]
+    busy_text = settings.bot_mention_busy_message
+    if member_openid:
+        busy_text = f"<@{member_openid}> {busy_text}"
+    passive_msg_id = (
+        source_msg_id
+        if target_group_openid == source_group_openid
+        else None
+    )
+    try:
+        await qq_message_service.send_group_message(
+            client,
+            target_group_openid,
+            busy_text,
+            msg_id=passive_msg_id,
+        )
+    except (httpx.HTTPError, RuntimeError):
+        logger.exception(
+            "发送 @ 频率提示失败，group_openid=%s，member_openid=%s",
+            source_group_openid,
+            member_openid,
+        )
+    except Exception:
+        logger.exception(
+            "发送 @ 频率提示时出现未预期异常，group_openid=%s，member_openid=%s",
+            source_group_openid,
+            member_openid,
+        )
+
+
+async def process_mentioned_group_message(
+    client: httpx.AsyncClient,
+    event_id: str,
+    source_group_openid: str,
+    source_msg_id: str,
+    item: MessageItem,
+) -> None:
+    if mention_rate_limiter.is_limited(item.member_openid):
+        logger.info(
+            "触发 @ 频率限制，忽略 AI 调用，group_openid=%s，member_openid=%s，limit=%s，window=%s",
+            source_group_openid,
+            item.member_openid,
+            mention_rate_limiter.limit,
+            mention_rate_limiter.window_seconds,
+        )
+        await send_mention_busy_reply(
+            client,
+            source_group_openid,
+            source_msg_id,
+            item.member_openid,
+        )
+        return
+
+    logger.info(
+        "机器人被 @，立即调用 AI，group_openid=%s，member_openid=%s",
+        source_group_openid,
+        item.member_openid,
+    )
+    try:
+        ai_reply = await call_ai(
+            client,
+            format_message_batch([item]),
+            GROUP_PROMPT_FILE,
+        )
+    except Exception:
+        logger.exception("被 @ 消息 AI 处理出现未预期异常，event_id=%s", event_id)
+        return
+
+    await deliver_group_reply(
+        client,
+        event_id,
+        source_group_openid,
+        source_msg_id,
+        ai_reply,
+    )
+
+
+async def process_group_message(
+    client: httpx.AsyncClient,
+    event_id: str,
+    source_group_openid: str,
+    member_openid: str,
+    source_msg_id: str,
+    content: str,
+    is_mentioned: bool,
+) -> None:
+    nickname = await resolve_member_nickname(
+        client,
+        source_group_openid,
+        member_openid,
+    )
+    logger.info(
+        "开始处理群消息，event_id=%s，group_openid=%s，member_openid=%s，nickname=%s，mentioned=%s，length=%s，content=%s",
+        event_id,
+        source_group_openid,
+        member_openid,
+        nickname,
+        is_mentioned,
+        len(content),
+        content,
+    )
+    item = MessageItem(
+        member_openid=member_openid,
+        nickname=nickname,
+        content=strip_mention_tags(content) or content,
+    )
+
+    if is_mentioned and settings.bot_mention_reply_enabled:
+        await process_mentioned_group_message(
+            client,
+            event_id,
+            source_group_openid,
+            source_msg_id,
+            item,
+        )
+        return
+
+    batch, buffered_count = await message_batcher.add(
+        source_group_openid,
+        item,
+    )
+    if batch is None:
+        logger.info(
+            "群消息已加入 AI 批次，group_openid=%s，progress=%s/%s",
+            source_group_openid,
+            buffered_count,
+            message_batcher.batch_size,
+        )
+        return
+
+    logger.info(
+        "群消息批次已满，开始调用 AI，group_openid=%s，count=%s",
+        source_group_openid,
+        len(batch),
+    )
+    try:
+        ai_reply = await call_ai(
+            client,
+            format_message_batch(batch),
+            GROUP_PROMPT_FILE,
+        )
+    except Exception:
+        logger.exception("AI 消息后台处理出现未预期异常，event_id=%s", event_id)
+        return
+
+    await deliver_group_reply(
+        client,
+        event_id,
+        source_group_openid,
+        source_msg_id,
+        ai_reply,
+    )
 
 
 PRIVATE_CHAT_DENIED_MESSAGE = "无私聊权限"
