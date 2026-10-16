@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
 from dotenv import load_dotenv
@@ -167,6 +167,7 @@ class Settings:
     qq_timeout_seconds: float
     qq_fetch_member_nickname: bool
     ai_mention_senders: bool
+    qq_private_chat_enabled: bool
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -188,6 +189,10 @@ class Settings:
                 True,
             ),
             ai_mention_senders=read_flag("AI_MENTION_SENDERS", True),
+            qq_private_chat_enabled=read_flag(
+                "QQ_PRIVATE_CHAT_ENABLED",
+                True,
+            ),
         )
 
     def missing_variables(self) -> list[str]:
@@ -353,6 +358,34 @@ class QQMessageService:
             )
         response.raise_for_status()
 
+    async def send_private_message(
+        self,
+        client: httpx.AsyncClient,
+        user_openid: str,
+        content: str,
+        msg_id: str | None = None,
+    ) -> None:
+        token = await self._token_manager.get_access_token(client)
+        body: dict[str, Any] = {"content": content, "msg_type": 0}
+        if msg_id:
+            body["msg_id"] = msg_id
+
+        url = f"https://api.bot.qq.com/v2/users/{user_openid}/messages"
+        response = await client.post(
+            url,
+            headers={"Authorization": f"QQBot {token}"},
+            json=body,
+        )
+        if response.status_code == 401:
+            self._token_manager.invalidate()
+        if response.is_error:
+            logger.error(
+                "QQ 私聊消息发送失败，status=%s，response=%s",
+                response.status_code,
+                response.text[:500],
+            )
+        response.raise_for_status()
+
 
 signature_service = SignatureService(settings.qq_app_secret)
 token_manager = QQTokenManager()
@@ -366,18 +399,26 @@ def ai_chat_completions_url(base_url: str) -> str:
     return f"{normalized}/chat/completions"
 
 
-async def read_system_prompt() -> str:
-    prompt_path = BASE_DIR / "prompt.txt"
+GROUP_PROMPT_FILE = "prompt-group.txt"
+CHAT_PROMPT_FILE = "prompt-chat.txt"
+
+
+async def read_system_prompt(prompt_file: str) -> str:
+    prompt_path = BASE_DIR / prompt_file
     return (await asyncio.to_thread(prompt_path.read_text, encoding="utf-8")).strip()
 
 
-async def call_ai(client: httpx.AsyncClient, user_message: str) -> str:
+async def call_ai(
+    client: httpx.AsyncClient,
+    user_message: str,
+    prompt_file: str,
+) -> str:
     try:
         if not settings.ai_base_url or not settings.ai_api_key or not settings.ai_model:
             raise RuntimeError("AI API 环境变量未完整配置")
-        system_prompt = await read_system_prompt()
+        system_prompt = await read_system_prompt(prompt_file)
         if not system_prompt:
-            raise RuntimeError("prompt.txt 为空")
+            raise RuntimeError(f"{prompt_file} 为空")
 
         response = await client.post(
             ai_chat_completions_url(settings.ai_base_url),
@@ -417,8 +458,8 @@ async def call_ai(client: httpx.AsyncClient, user_message: str) -> str:
                 return text
         raise RuntimeError("AI API 未返回有效文本")
     except FileNotFoundError:
-        logger.exception("找不到系统提示词文件 prompt.txt")
-        return "系统提示词文件 prompt.txt 不存在，请联系管理员。"
+        logger.exception("找不到系统提示词文件 %s", prompt_file)
+        return f"系统提示词文件 {prompt_file} 不存在，请联系管理员。"
     except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, RuntimeError):
         logger.exception("AI API 调用失败")
         return "AI 服务暂时不可用，请稍后再试。"
@@ -584,51 +625,38 @@ def format_message_batch(messages: list[MessageItem]) -> str:
 
 async def send_ai_reply(
     client: httpx.AsyncClient,
-    group_openid: str,
+    send_part: Callable[[httpx.AsyncClient, str, str | None], Awaitable[None]],
+    target_label: str,
     source_msg_id: str | None,
     ai_reply: str,
 ) -> None:
     parts, truncated = split_reply(ai_reply)
-    await qq_message_service.send_group_message(
-        client,
-        group_openid,
-        parts[0],
-        msg_id=source_msg_id,
-    )
+    await send_part(client, parts[0], source_msg_id)
     logger.info(
-        "已发送第 1/%s 片回复，group_openid=%s，truncated=%s",
+        "已发送第 1/%s 片回复，target=%s，truncated=%s",
         len(parts),
-        group_openid,
+        target_label,
         truncated,
     )
 
     for index, part in enumerate(parts[1:], start=2):
         await asyncio.sleep(0.8)
         try:
-            await qq_message_service.send_group_message(
-                client,
-                group_openid,
-                part,
-            )
+            await send_part(client, part, None)
             logger.info(
-                "已发送第 %s/%s 片主动回复，group_openid=%s",
+                "已发送第 %s/%s 片主动回复，target=%s",
                 index,
                 len(parts),
-                group_openid,
+                target_label,
             )
         except httpx.HTTPError:
             logger.warning(
-                "主动消息发送失败，停止后续分片，group_openid=%s",
-                group_openid,
+                "主动消息发送失败，停止后续分片，target=%s",
+                target_label,
             )
             if source_msg_id:
                 try:
-                    await qq_message_service.send_group_message(
-                        client,
-                        group_openid,
-                        "（内容过长已截断）",
-                        msg_id=source_msg_id,
-                    )
+                    await send_part(client, "（内容过长已截断）", source_msg_id)
                 except (httpx.HTTPError, RuntimeError):
                     logger.exception("发送内容截断提示失败")
             break
@@ -681,7 +709,11 @@ async def process_group_message(
         len(batch),
     )
     try:
-        ai_reply = await call_ai(client, format_message_batch(batch))
+        ai_reply = await call_ai(
+            client,
+            format_message_batch(batch),
+            GROUP_PROMPT_FILE,
+        )
     except Exception:
         logger.exception("AI 消息后台处理出现未预期异常，event_id=%s", event_id)
         return
@@ -701,10 +733,23 @@ async def process_group_message(
             target_group_openid,
             mention_prefix.strip(),
         )
+    async def send_group_part(
+        target_client: httpx.AsyncClient,
+        content: str,
+        msg_id: str | None,
+    ) -> None:
+        await qq_message_service.send_group_message(
+            target_client,
+            target_group_openid,
+            content,
+            msg_id=msg_id,
+        )
+
     try:
         await send_ai_reply(
             client,
-            target_group_openid,
+            send_group_part,
+            f"group:{target_group_openid}",
             passive_msg_id,
             outgoing_reply,
         )
@@ -719,6 +764,60 @@ async def process_group_message(
             "向目标群发送回复时出现未预期异常，event_id=%s，target_group_openid=%s",
             event_id,
             target_group_openid,
+        )
+
+
+async def process_private_message(
+    client: httpx.AsyncClient,
+    event_id: str,
+    user_openid: str,
+    source_msg_id: str,
+    content: str,
+) -> None:
+    logger.info(
+        "开始处理私聊消息，event_id=%s，user_openid=%s，length=%s，content=%s",
+        event_id,
+        user_openid,
+        len(content),
+        content,
+    )
+    try:
+        ai_reply = await call_ai(client, content, CHAT_PROMPT_FILE)
+    except Exception:
+        logger.exception("私聊 AI 消息处理出现未预期异常，event_id=%s", event_id)
+        return
+
+    async def send_private_part(
+        target_client: httpx.AsyncClient,
+        part: str,
+        msg_id: str | None,
+    ) -> None:
+        await qq_message_service.send_private_message(
+            target_client,
+            user_openid,
+            part,
+            msg_id=msg_id,
+        )
+
+    try:
+        await send_ai_reply(
+            client,
+            send_private_part,
+            f"user:{user_openid}",
+            source_msg_id,
+            ai_reply,
+        )
+    except (httpx.HTTPError, RuntimeError):
+        logger.exception(
+            "私聊回复发送失败，event_id=%s，user_openid=%s",
+            event_id,
+            user_openid,
+        )
+    except Exception:
+        logger.exception(
+            "私聊回复发送时出现未预期异常，event_id=%s，user_openid=%s",
+            event_id,
+            user_openid,
         )
 
 
@@ -785,6 +884,57 @@ async def webhook(request: Request, background_tasks: BackgroundTasks) -> JSONRe
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     event_type = payload.get("t")
+    if event_type == "C2C_MESSAGE_CREATE":
+        if not settings.qq_private_chat_enabled:
+            logger.info("私聊功能已关闭，忽略事件，event_id=%s", payload.get("id", ""))
+            return JSONResponse({"op": 12})
+
+        chat_data = payload.get("d") or {}
+        chat_author = chat_data.get("author") or {}
+        if chat_author.get("bot") is True:
+            logger.info("忽略机器人自身消息，event_id=%s", payload.get("id", ""))
+            return JSONResponse({"op": 12})
+
+        chat_event_id = str(payload.get("id", ""))
+        user_openid = str(
+            chat_author.get("user_openid")
+            or chat_data.get("user_openid")
+            or ""
+        )
+        chat_content = str(chat_data.get("content", ""))
+        chat_msg_id = str(chat_data.get("id", ""))
+
+        logger.info(
+            "收到私聊消息事件原文，event_id=%s，payload=%s",
+            chat_event_id,
+            format_event_dump(payload),
+        )
+
+        if not user_openid or not chat_msg_id or not chat_content.strip():
+            logger.warning(
+                "私聊消息字段不完整，event_id=%s，user_openid=%s，msg_id=%s",
+                chat_event_id,
+                bool(user_openid),
+                bool(chat_msg_id),
+            )
+            return JSONResponse({"op": 12})
+
+        logger.info(
+            "已接收私聊消息，event_id=%s，user_openid=%s，msg_id=%s",
+            chat_event_id,
+            user_openid,
+            chat_msg_id,
+        )
+        background_tasks.add_task(
+            process_private_message,
+            request.app.state.http_client,
+            chat_event_id,
+            user_openid,
+            chat_msg_id,
+            chat_content,
+        )
+        return JSONResponse({"op": 12})
+
     if event_type != "GROUP_MESSAGE_CREATE":
         logger.info("忽略事件类型 t=%s", event_type)
         return JSONResponse({"op": 12})
