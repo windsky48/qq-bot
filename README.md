@@ -80,7 +80,7 @@ AI_MODEL=your_model_name
 | `AI_API_KEY` | AI API 密钥 |
 | `AI_MODEL` | AI 模型名称 |
 | `AI_EXTRA_HEADERS` | 可选，AI API 额外请求头 JSON 字典 |
-| `AI_MENTION_SENDERS` | 可选，是否在 AI 回复开头 @ 本批消息发送者，默认 `true` |
+| `AI_MENTION_INSTRUCTION` | 可选，是否在发送给 AI 的群聊内容末尾附加 @ 成员说明，默认 `true` |
 | `QQ_PRIVATE_CHAT_ENABLED` | 可选，是否启用私聊消息，默认 `true` |
 | `QQ_PRIVATE_CHAT_ALLOWLIST` | 可选，允许私聊的 `user_openid` JSON 字符串列表，留空表示不限制 |
 | `QQ_FETCH_MEMBER_NICKNAME` | 可选，是否调用 QQ API 获取群成员昵称，默认 `true` |
@@ -206,19 +206,29 @@ logs/YYYY-MM-DD.log
 
 ## @ 成员
 
-默认会在每批 AI 回复开头加上本批消息发送者的 @，例如：
+程序不再自动添加 @，而是由 AI 自行决定是否点名成员。
+
+发送给 AI 的群聊批次文本末尾会附加 @ 说明：
 
 ```text
-<@成员openid1> <@成员openid2> AI 回复内容
+【@ 成员说明】
+如果你想在回复中点名某位群友，请在需要的位置使用 <@成员openid> 的形式……
+本批消息中可 @ 的成员有：<@ABC123>、<@DEF456>
+是否 @ 由你根据语境自行判断……
+```
+
+AI 回复示例：
+
+```text
+<@ABC123> 你说的这个问题我知道
 ```
 
 相关行为：
 
-- 同一批中的重复发送者只 @ 一次。
-- @ 前缀位于第一片回复开头。
-- @ 前缀最长约 400 字符，超出时会按发送者数量截断。
-- 可用 `AI_MENTION_SENDERS=false` 关闭。
-- 发送给 AI 的批次文本会说明：需要 @ 某个成员时，在回复中使用 `<@成员openid>` 形式。
+- 是否 @ 由 AI 自行决定，程序不强制添加。
+- AI 输出的 `<@成员openid>` 会被 QQ 平台渲染为 @。
+- 若 AI 输出中含 `@`，日志会记录数量：`AI 回复中包含 @ 成员，count=1`。
+- 可用 `AI_MENTION_INSTRUCTION=false` 关闭该说明。
 
 ## 回复分片
 

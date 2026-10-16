@@ -185,7 +185,7 @@ class Settings:
     ai_timeout_seconds: float
     qq_timeout_seconds: float
     qq_fetch_member_nickname: bool
-    ai_mention_senders: bool
+    ai_mention_instruction: bool
     qq_private_chat_enabled: bool
     qq_private_chat_allowlist: tuple[str, ...]
 
@@ -208,7 +208,7 @@ class Settings:
                 "QQ_FETCH_MEMBER_NICKNAME",
                 True,
             ),
-            ai_mention_senders=read_flag("AI_MENTION_SENDERS", True),
+            ai_mention_instruction=read_flag("AI_MENTION_INSTRUCTION", True),
             qq_private_chat_enabled=read_flag(
                 "QQ_PRIVATE_CHAT_ENABLED",
                 True,
@@ -606,11 +606,8 @@ async def resolve_member_nickname(
         return ""
 
 
-MENTION_PREFIX_MAX_LENGTH = 400
-
-
-def build_mention_prefix(messages: list[MessageItem]) -> str:
-    if not settings.ai_mention_senders:
+def build_mention_instruction(messages: list[MessageItem]) -> str:
+    if not settings.ai_mention_instruction:
         return ""
 
     member_openids = list(
@@ -623,15 +620,20 @@ def build_mention_prefix(messages: list[MessageItem]) -> str:
     if not member_openids:
         return ""
 
-    mentions = [f"<@{member_openid}>" for member_openid in member_openids]
-    prefix = " ".join(mentions) + " "
-    if len(prefix) > MENTION_PREFIX_MAX_LENGTH:
-        prefix = ""
-        for mention in mentions:
-            if len(prefix) + len(mention) + 1 > MENTION_PREFIX_MAX_LENGTH:
-                break
-            prefix += mention + " "
-    return prefix
+    available = "、".join(
+        f"<@{member_openid}>"
+        for member_openid in member_openids
+    )
+    return (
+        "\n\n【@ 成员说明】\n"
+        "如果你想在回复中点名某位群友，请在需要的位置使用 "
+        "<@成员openid> 的形式，"
+        "例如 <@ABC123> 你说的这个问题我知道。\n"
+        "可以 @ 一位或多位，多位之间用空格分隔，且必须写在回复正文中。\n"
+        f"本批消息中可 @ 的成员有：{available}\n"
+        "是否 @ 由你根据语境自行判断；"
+        "如果不需要点名任何人，请不要输出 <@ 形式的文本。"
+    )
 
 
 def format_message_batch(messages: list[MessageItem]) -> str:
@@ -639,11 +641,11 @@ def format_message_batch(messages: list[MessageItem]) -> str:
         f"第 {index} 条消息，发送者：{message.sender_label}（ID：{message.member_openid}）\n{message.content}"
         for index, message in enumerate(messages, start=1)
     )
-    return (
-        f"以下是群聊中连续收到的 {len(messages)} 条消息，"
-        f"其中发送者 ID 形如 ABC 的成员可用 <@ABC> 的形式 @ 对方：\n\n"
+    batch_text = (
+        f"以下是群聊中连续收到的 {len(messages)} 条消息：\n\n"
         f"{formatted_messages}"
     )
+    return batch_text + build_mention_instruction(messages)
 
 
 async def send_ai_reply(
@@ -747,15 +749,15 @@ async def process_group_message(
         if target_group_openid == source_group_openid
         else None
     )
-    mention_prefix = build_mention_prefix(batch)
-    outgoing_reply = mention_prefix + ai_reply
-    if mention_prefix:
+    mention_count = ai_reply.count("<@")
+    if mention_count:
         logger.info(
-            "AI 回复已添加 @ 前缀，group_openid=%s，target_group_openid=%s，mentions=%s",
+            "AI 回复中包含 @ 成员，group_openid=%s，target_group_openid=%s，count=%s",
             source_group_openid,
             target_group_openid,
-            mention_prefix.strip(),
+            mention_count,
         )
+
     async def send_group_part(
         target_client: httpx.AsyncClient,
         content: str,
@@ -774,7 +776,7 @@ async def process_group_message(
             send_group_part,
             f"group:{target_group_openid}",
             passive_msg_id,
-            outgoing_reply,
+            ai_reply,
         )
     except (httpx.HTTPError, RuntimeError):
         logger.exception(
