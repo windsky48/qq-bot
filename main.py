@@ -582,7 +582,7 @@ def format_event_dump(payload: Any) -> str:
     return text[:4000]
 
 
-MENTION_TAG_PATTERN = re.compile(r"<@[^>\s]{1,64}>")
+MENTION_TAG_PATTERN = re.compile(r"<@([^>\s]{1,64})>")
 
 
 @dataclass(frozen=True)
@@ -705,13 +705,38 @@ def build_mention_instruction(messages: list[MessageItem]) -> str:
     return (
         "\n\n【@ 成员说明】\n"
         "如果你想在回复中点名某位群友，请在需要的位置使用 "
-        "<@成员openid> 的形式，"
-        "例如 <@ABC123> 你说的这个问题我知道。\n"
+        "<@成员openid> 的形式，openid 必须原样取自下方列表。\n"
+        "只能使用下方列表中出现过的 openid，"
+        "严禁自行编造、猜测或改写 openid；"
+        "使用不存在的 openid 会导致 @ 失效并显示为乱码文本。\n"
+        f"本批消息中可 @ 的成员 openid 为：{available}\n"
         "可以 @ 一位或多位，多位之间用空格分隔，且必须写在回复正文中。\n"
-        f"本批消息中可 @ 的成员有：{available}\n"
         "是否 @ 由你根据语境自行判断；"
         "如果不需要点名任何人，请不要输出 <@ 形式的文本。"
     )
+
+
+def sanitize_mentions(
+    text: str,
+    allowed_openids: dict[str, str],
+) -> tuple[str, int, int]:
+    """仅保留本批消息中真实存在的 @ 目标，避免 AI 编造 openid。"""
+
+    found = re.findall(MENTION_TAG_PATTERN, text)
+    valid_count = sum(
+        1 for member_openid in found if member_openid in allowed_openids
+    )
+    invalid_count = len(found) - valid_count
+
+    def replace_mention(match: re.Match[str]) -> str:
+        member_openid = match.group(1)
+        if member_openid in allowed_openids:
+            return match.group(0)
+        nickname = allowed_openids.get(member_openid)
+        return f"@{nickname}" if nickname else "@群友"
+
+    sanitized = MENTION_TAG_PATTERN.sub(replace_mention, text)
+    return sanitized, valid_count, invalid_count
 
 
 def format_message_batch(messages: list[MessageItem]) -> str:
@@ -771,20 +796,36 @@ async def deliver_group_reply(
     source_group_openid: str,
     source_msg_id: str,
     ai_reply: str,
+    items: list[MessageItem],
 ) -> None:
+    allowed_openids = {
+        item.member_openid: item.nickname
+        for item in items
+        if item.member_openid
+    }
+    ai_reply, valid_mentions, invalid_mentions = sanitize_mentions(
+        ai_reply,
+        allowed_openids,
+    )
+    if invalid_mentions:
+        logger.warning(
+            "AI 回复中存在无效 @ 目标，已替换为普通文本，event_id=%s，invalid=%s",
+            event_id,
+            invalid_mentions,
+        )
+
     target_group_openid = settings.qq_group_routes[source_group_openid]
     passive_msg_id = (
         source_msg_id
         if target_group_openid == source_group_openid
         else None
     )
-    mention_count = ai_reply.count("<@")
-    if mention_count:
+    if valid_mentions:
         logger.info(
-            "AI 回复中包含 @ 成员，group_openid=%s，target_group_openid=%s，count=%s",
+            "AI 回复中包含有效 @ 成员，group_openid=%s，target_group_openid=%s，count=%s",
             source_group_openid,
             target_group_openid,
-            mention_count,
+            valid_mentions,
         )
 
     async def send_group_part(
@@ -901,6 +942,7 @@ async def process_mentioned_group_message(
         source_group_openid,
         source_msg_id,
         ai_reply,
+        [item],
     )
 
 
@@ -978,6 +1020,7 @@ async def process_group_message(
         source_group_openid,
         source_msg_id,
         ai_reply,
+        batch,
     )
 
 
