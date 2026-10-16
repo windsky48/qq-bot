@@ -8,6 +8,7 @@
 - 支持 `op=13` 回调地址验证
 - 使用 Ed25519 校验 `op=0` 事件签名
 - 处理 `GROUP_MESSAGE_CREATE` 全量群消息
+- 处理 `C2C_MESSAGE_CREATE` 私聊消息，单条即时回复
 - 使用 JSON 字典配置接收群到发送群的一对一路由
 - 每个接收群独立累计 5 条消息后调用一次 AI
 - 缓存并提前刷新 QQ `access_token`
@@ -19,7 +20,7 @@
 
 - Python 3.10 或更高版本
 - 已在 QQ 开放平台创建机器人并取得 AppID、AppSecret
-- 已订阅 `GROUP_MESSAGE_CREATE` 事件
+- 已订阅 `GROUP_MESSAGE_CREATE` 事件；如需私聊，还需订阅 `C2C_MESSAGE_CREATE` 事件
 - 群主已在手机 QQ 群设置中，将机器人消息范围设置为“获取群内全部消息”
 - 可公网访问的 HTTP/HTTPS 回调地址，端口使用 `80`、`443`、`8080` 或 `8443`
 
@@ -57,6 +58,17 @@ AI_API_KEY=your_ai_api_key
 AI_MODEL=your_model_name
 ```
 
+### 提示词文件
+
+群聊和私聊使用不同提示词文件：
+
+| 文件 | 用途 |
+| --- | --- |
+| `prompt-group.txt` | 群聊场景系统提示词 |
+| `prompt-chat.txt` | 私聊场景系统提示词 |
+
+两个文件都需要存在且不能为空。程序每次调用 AI 时读取对应文件，修改内容无需重启。
+
 ### 环境变量说明
 
 | 变量 | 说明 |
@@ -69,6 +81,8 @@ AI_MODEL=your_model_name
 | `AI_MODEL` | AI 模型名称 |
 | `AI_EXTRA_HEADERS` | 可选，AI API 额外请求头 JSON 字典 |
 | `AI_MENTION_SENDERS` | 可选，是否在 AI 回复开头 @ 本批消息发送者，默认 `true` |
+| `QQ_PRIVATE_CHAT_ENABLED` | 可选，是否启用私聊消息，默认 `true` |
+| `QQ_PRIVATE_CHAT_ALLOWLIST` | 可选，允许私聊的 `user_openid` JSON 字符串列表，留空表示不限制 |
 | `QQ_FETCH_MEMBER_NICKNAME` | 可选，是否调用 QQ API 获取群成员昵称，默认 `true` |
 | `AI_TIMEOUT_SECONDS` | 可选，AI 请求超时秒数，默认 `60` |
 | `QQ_TIMEOUT_SECONDS` | 可选，QQ API 请求超时秒数，默认 `30` |
@@ -127,6 +141,37 @@ http://你的公网地址:8080/webhook
 ```
 
 程序只处理 `POST /webhook`。访问根路径 `/` 返回 404 属于正常现象。QQ 平台发送 `op=13` 验证请求时，程序会自动生成并返回签名。
+
+## 私聊
+
+私聊依赖 QQ 开放平台的单聊事件 `C2C_MESSAGE_CREATE`，需要在回调配置中勾选该事件。
+
+私聊行为：
+
+- 每条消息立即调用 AI，不参与 5 条批处理。
+- 使用 `prompt-chat.txt` 作为系统提示词。
+- 通过 `POST /v2/users/{user_openid}/messages` 被动回复。
+- 不获取群成员昵称，不添加 @ 前缀。
+- 可用 `QQ_PRIVATE_CHAT_ENABLED=false` 关闭，关闭后私聊事件不回调 AI。
+
+白名单配置：
+
+```env
+QQ_PRIVATE_CHAT_ALLOWLIST=["user_openid_1","user_openid_2"]
+```
+
+行为：
+
+- 留空表示不限制，任何人都可私聊。
+- 配置后，仅列表内的 `user_openid` 会调用 AI。
+- 不在列表内的消息会被忽略，并回复 `无私聊权限`。
+- 列表值是私聊日志中的 `user_openid`，不是普通 QQ 号，需加双引号。
+
+日志中会显示：
+
+```text
+开始处理私聊消息，event_id=...，user_openid=...，length=...，content=...
+```
 
 ## 消息处理流程
 

@@ -128,6 +128,25 @@ def read_header_map(environment_name: str) -> dict[str, str]:
     }
 
 
+def read_openid_list(environment_name: str) -> tuple[str, ...]:
+    raw_value = os.getenv(environment_name, "").strip()
+    if not raw_value:
+        return ()
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"环境变量 {environment_name} 必须是 JSON 字符串列表"
+        ) from exc
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise RuntimeError(
+            f"环境变量 {environment_name} 必须是非空字符串组成的 JSON 列表"
+        )
+    return tuple(dict.fromkeys(item.strip() for item in value))
+
+
 def read_group_routes(environment_name: str) -> dict[str, str]:
     raw_value = os.getenv(environment_name, "").strip()
     if not raw_value:
@@ -168,6 +187,7 @@ class Settings:
     qq_fetch_member_nickname: bool
     ai_mention_senders: bool
     qq_private_chat_enabled: bool
+    qq_private_chat_allowlist: tuple[str, ...]
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -192,6 +212,9 @@ class Settings:
             qq_private_chat_enabled=read_flag(
                 "QQ_PRIVATE_CHAT_ENABLED",
                 True,
+            ),
+            qq_private_chat_allowlist=read_openid_list(
+                "QQ_PRIVATE_CHAT_ALLOWLIST",
             ),
         )
 
@@ -767,6 +790,41 @@ async def process_group_message(
         )
 
 
+PRIVATE_CHAT_DENIED_MESSAGE = "无私聊权限"
+
+
+async def process_private_message_denied(
+    client: httpx.AsyncClient,
+    event_id: str,
+    user_openid: str,
+    source_msg_id: str,
+) -> None:
+    logger.info(
+        "私聊白名单校验失败，忽略该消息，event_id=%s，user_openid=%s",
+        event_id,
+        user_openid,
+    )
+    try:
+        await qq_message_service.send_private_message(
+            client,
+            user_openid,
+            PRIVATE_CHAT_DENIED_MESSAGE,
+            msg_id=source_msg_id,
+        )
+    except (httpx.HTTPError, RuntimeError):
+        logger.exception(
+            "发送私聊权限提示失败，event_id=%s，user_openid=%s",
+            event_id,
+            user_openid,
+        )
+    except Exception:
+        logger.exception(
+            "发送私聊权限提示时出现未预期异常，event_id=%s，user_openid=%s",
+            event_id,
+            user_openid,
+        )
+
+
 async def process_private_message(
     client: httpx.AsyncClient,
     event_id: str,
@@ -916,6 +974,24 @@ async def webhook(request: Request, background_tasks: BackgroundTasks) -> JSONRe
                 chat_event_id,
                 bool(user_openid),
                 bool(chat_msg_id),
+            )
+            return JSONResponse({"op": 12})
+
+        if (
+            settings.qq_private_chat_allowlist
+            and user_openid not in settings.qq_private_chat_allowlist
+        ):
+            logger.info(
+                "忽略不在私聊白名单中的消息，event_id=%s，user_openid=%s",
+                chat_event_id,
+                user_openid,
+            )
+            background_tasks.add_task(
+                process_private_message_denied,
+                request.app.state.http_client,
+                chat_event_id,
+                user_openid,
+                chat_msg_id,
             )
             return JSONResponse({"op": 12})
 
